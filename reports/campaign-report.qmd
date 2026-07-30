@@ -1,0 +1,180 @@
+---
+title: "Campaign Impact Analysis"
+subtitle: "Prepared for the Head of Marketing"
+format:
+  html:
+    theme: flatly
+    mainfont: "-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif"
+    toc: true
+    toc-depth: 2
+    embed-resources: true
+    fig-width: 7
+    fig-height: 3.4
+execute:
+  echo: false
+  warning: false
+params:
+  outcome: "visit"
+  arm: "Mens E-Mail"
+---
+
+```{r setup}
+library(ggplot2)
+library(knitr)
+
+# Quarto evaluates chunks in an environment created by rmarkdown::render(),
+# not the global environment. Sourcing into knit_global() puts the analysis
+# functions in the same environment they are called from.
+root <- rprojroot::find_root(rprojroot::has_file("config.yml"))
+for (f in list.files(file.path(root, "R"), pattern = "[.][Rr]$", full.names = TRUE)) {
+  source(f, local = knitr::knit_global())
+}
+
+cfg <- config::get(file = file.path(root, "config.yml"))
+cfg$data$path <- file.path(root, cfg$data$path)
+
+res <- build_results(cfg, outcome = params$outcome, arm = params$arm)
+```
+
+## Summary
+
+```{r}
+#| output: asis
+cat(paste0("- ", results_headlines(res), collapse = "\n"))
+```
+
+## What was analysed
+
+```{r}
+m <- res$meta
+kable(data.frame(
+  Field = c("Observations", "Groups", "Control group", "Outcome",
+            "Covariates considered", "Significance level", "Multiple-comparison correction",
+            "Source", "Generated"),
+  Value = c(format(m$n, big.mark = ","),
+            paste(sprintf("%s (%s)", m$arms, format(m$n_by_arm, big.mark = ",")), collapse = "; "),
+            m$control, m$outcome,
+            paste(m$covariates, collapse = ", "),
+            m$alpha, m$correction,
+            basename(m$source), m$generated),
+  check.names = FALSE))
+```
+
+## Method selected
+
+**`r res$diagnosis$designs[[res$diagnosis$recommended]]$label`**
+
+`r res$diagnosis$rationale`
+
+```{r}
+d <- res$diagnosis
+kable(data.frame(
+  Design = vapply(d$designs, `[[`, character(1), "label"),
+  Supported = ifelse(vapply(d$designs, `[[`, logical(1), "supported"), "yes", "no"),
+  Reason = vapply(d$designs, `[[`, character(1), "reason"),
+  check.names = FALSE, row.names = NULL))
+```
+
+## Effect estimates
+
+```{r}
+e <- res$experiment$estimates
+kable(data.frame(
+  Arm = e$arm,
+  Estimate = sprintf("%.4f", e$estimate),
+  `95% CI` = sprintf("%.4f – %.4f", e$ci_low, e$ci_high),
+  `Relative lift` = ifelse(is.na(e$rel_lift), "—", sprintf("%+.1f%%", 100 * e$rel_lift)),
+  `p (adjusted)` = ifelse(e$p_adjusted < 1e-4, "<0.0001", sprintf("%.4f", e$p_adjusted)),
+  `Detection floor (MDE)` = sprintf("%.4f", e$mde),
+  check.names = FALSE))
+```
+
+```{r}
+ggplot(e, aes(x = estimate, y = arm)) +
+  geom_vline(xintercept = 0, linetype = "dashed", colour = "grey55") +
+  geom_errorbarh(aes(xmin = ci_low, xmax = ci_high), height = 0.12, linewidth = 0.6) +
+  geom_point(size = 3, colour = "#2c7fb8") +
+  labs(x = paste("Effect on", res$meta$outcome), y = NULL) +
+  theme_minimal(base_size = 12) +
+  theme(panel.grid.major.y = element_blank())
+```
+
+The detection floor is the smallest effect this design could reliably identify. An estimate close to that floor is statistically detectable but its magnitude is imprecisely measured — worth noting before budgeting against it.
+
+```{r}
+#| output: asis
+if (!is.null(res$bayes)) {
+  p <- res$bayes$posteriors
+  cat("### Probability readout\n\n")
+  print(kable(data.frame(
+    Arm = p$arm,
+    `Probability it beats control` = sprintf("%.3f", p$prob_beats_control),
+    `Median difference` = sprintf("%.4f", p$diff_median),
+    `95% credible interval` = sprintf("%.4f – %.4f", p$diff_low, p$diff_high),
+    check.names = FALSE)))
+  cat(sprintf("\n\n%s prior, %s draws, seed %d.\n",
+              res$bayes$meta$prior,
+              format(res$bayes$meta$draws, big.mark = ","),
+              res$bayes$meta$seed))
+}
+```
+
+## Assumptions checked
+
+```{r}
+kable(data.frame(
+  Check = vapply(res$checks, `[[`, character(1), "label"),
+  Status = vapply(res$checks, `[[`, character(1), "status"),
+  Finding = vapply(res$checks, `[[`, character(1), "message"),
+  check.names = FALSE, row.names = NULL))
+```
+
+## How much can an unadjusted comparison mislead?
+
+```{r}
+#| output: asis
+bmeta <- res$benchmark$meta
+cat(sprintf(
+  "The randomised data gives a known true effect. A biased subsample of %s observations was then drawn where retention depends on %s, deliberately breaking the random assignment. Each estimator was run on that subsample and scored against the truth.\n\nThis sample is constructed, not observed. It exists to test whether the adjustment methods recover an answer that is already known.\n",
+  format(bmeta$n_confounded, big.mark = ","),
+  paste(names(bmeta$construction$drivers), collapse = " and ")))
+```
+
+```{r}
+b <- res$benchmark$benchmark
+kable(data.frame(
+  Estimator = b$estimator,
+  Estimate = sprintf("%.4f", b$estimate),
+  `True effect` = sprintf("%.4f", b$truth),
+  Error = sprintf("%+.1f%%", b$pct_error),
+  `95% CI` = sprintf("%.4f – %.4f", b$ci_low, b$ci_high),
+  `Interval covers truth` = ifelse(b$covers_truth, "yes", "no"),
+  check.names = FALSE))
+```
+
+```{r}
+bp <- b
+bp$estimator <- factor(bp$estimator, levels = rev(bp$estimator))
+ggplot(bp, aes(x = estimate, y = estimator)) +
+  geom_vline(xintercept = res$benchmark$truth$estimate, linetype = "dashed",
+             colour = "#d95f02", linewidth = 0.7) +
+  geom_errorbarh(aes(xmin = ci_low, xmax = ci_high), height = 0.12, linewidth = 0.6) +
+  geom_point(aes(colour = covers_truth), size = 3) +
+  scale_colour_manual(values = c("TRUE" = "#2c7fb8", "FALSE" = "#d7301f"), guide = "none") +
+  labs(x = paste("Effect on", res$meta$outcome), y = NULL,
+       caption = "Dashed line: true effect from the randomised data") +
+  theme_minimal(base_size = 12) +
+  theme(panel.grid.major.y = element_blank())
+```
+
+```{r}
+#| output: asis
+ov <- res$benchmark$overlap
+cat(sprintf("**Common support: %s.** %s\n", ov$status, ov$message))
+```
+
+## Notes on interpretation
+
+- An estimate is only as good as the assumption that identifies it. This report states which assumptions were checked and which failed.
+- Where a validity check fails, the estimate is still shown but should not be treated as reliable without addressing the cause.
+- Adjustment corrects for measured differences between groups. It cannot correct for anything that was not measured.

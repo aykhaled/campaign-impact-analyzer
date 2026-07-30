@@ -2,14 +2,36 @@
 # The ONLY module aware of client column names. Everything downstream
 # uses the canonical vocabulary: treatment / period / unit_id.
 
+# Resolves the data source. Prefers the configured path (the real CSV in
+# development); falls back to a committed .rds so the deployed app is
+# self-contained without shipping raw data.
+resolve_source <- function(cfg, path = NULL) {
+  candidate <- path %||% cfg$data$path
+  if (!is.null(candidate) && file.exists(candidate)) return(candidate)
+
+  fallback <- tryCatch({
+    root <- rprojroot::find_root(rprojroot::has_file("config.yml"))
+    file.path(root, "inst", "extdata", "hillstrom.rds")
+  }, error = function(e) file.path("inst", "extdata", "hillstrom.rds"))
+
+  if (file.exists(fallback)) return(fallback)
+
+  stop("No data source found. Looked for '", candidate, "' and '", fallback,
+       "'. See the README for the dataset fetch step.", call. = FALSE)
+}
+
+read_source <- function(path) {
+  if (grepl("[.]rds$", path, ignore.case = TRUE)) {
+    readRDS(path)
+  } else {
+    utils::read.csv(path, stringsAsFactors = FALSE)
+  }
+}
+
 load_campaign_data <- function(cfg, path = NULL) {
 
-  path <- path %||% cfg$data$path
-  if (!file.exists(path)) {
-    stop("Data file not found: ", path, call. = FALSE)
-  }
-
-  raw <- utils::read.csv(path, stringsAsFactors = FALSE)
+  path <- resolve_source(cfg, path)
+  raw  <- read_source(path)
 
   # ---- structural columns -------------------------------------------------
   treat_col <- cfg$columns$treatment
@@ -53,7 +75,7 @@ load_campaign_data <- function(cfg, path = NULL) {
   list(
     data = dat,
     meta = list(
-      source        = path,
+      source        = basename(path),
       n             = nrow(dat),
       arms          = levels(dat$treatment),
       control       = control,

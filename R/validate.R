@@ -1,121 +1,137 @@
-# diagnose.R — method routing. Given data, config, and validity checks,
-# determine which designs the data supports, which it rules out, and why.
-# Availability and appropriateness are separate judgements: a method can be
-# computable on this data and still be the wrong one to use.
+# validate.R — assumption checks. Each returns a structured result carrying a
+# status and a plain-language explanation. Pure functions: no printing, no Shiny.
+# The explanation travels with the result so the app and the report cannot
+# describe the same check differently.
 
-new_design <- function(id, label, supported, reason) {
-  structure(list(id = id, label = label, supported = supported, reason = reason),
-            class = "design_option")
-}
-
-# ---- randomised experiment ------------------------------------------------
-
-assess_randomised <- function(cd, cfg, checks) {
-  id <- "randomised"; label <- "Randomised experiment"
-
-  if (length(cd$meta$arms) < 2) {
-    return(new_design(id, label, FALSE,
-      "Fewer than two treatment groups are present, so there is nothing to compare."))
-  }
-  if (identical(checks$group_size$status, "fail")) {
-    return(new_design(id, label, FALSE,
-      paste("At least one group is too small to estimate an effect.",
-            checks$group_size$message)))
-  }
-  if (identical(checks$balance$status, "fail")) {
-    return(new_design(id, label, FALSE,
-      paste("Covariate balance fails, so the groups cannot be treated as randomly assigned.",
-            "A simple comparison of group means would confound the treatment effect with pre-existing differences.")))
-  }
-  if (identical(checks$balance$status, "not_applicable")) {
-    return(new_design(id, label, TRUE,
-      "No covariates are declared, so randomisation is assumed rather than verified. The estimate is only as trustworthy as that assumption."))
-  }
-  new_design(id, label, TRUE,
-    "Treatment groups are balanced on all declared covariates, consistent with random assignment. Differences in outcomes can be attributed to the treatment.")
-}
-
-# ---- propensity-based adjustment (cross-sectional observational) ----------
-
-assess_propensity <- function(cd, cfg, checks) {
-  id <- "propensity"; label <- "Propensity-adjusted comparison"
-
-  if (length(cd$meta$arms) < 2) {
-    return(new_design(id, label, FALSE, "Fewer than two treatment groups are present."))
-  }
-  if (!length(cd$meta$covariates)) {
-    return(new_design(id, label, FALSE,
-      "No covariates are declared. Adjustment requires the variables that drive group membership."))
-  }
-  if (identical(checks$group_size$status, "fail")) {
-    return(new_design(id, label, FALSE,
-      "At least one group is too small to fit a propensity model reliably."))
-  }
-  new_design(id, label, TRUE,
-    "Covariates are available to model group membership and adjust for measured differences. This corrects for imbalance in the variables you observed; it cannot correct for anything you did not measure.")
-}
-
-# ---- difference-in-differences --------------------------------------------
-
-assess_did <- function(cd, cfg, checks) {
-  id <- "did"; label <- "Difference-in-differences"
-
-  if (!cd$meta$has_period) {
-    return(new_design(id, label, FALSE,
-      "No period column is configured. Difference-in-differences compares change over time between groups, which requires observations from before and after the intervention."))
-  }
-  per_arm <- tapply(cd$data$period, cd$data$treatment,
-                    function(p) length(unique(p)))
-  if (any(per_arm < 2)) {
-    return(new_design(id, label, FALSE,
-      "At least one group is observed in only one period, so its change over time cannot be measured."))
-  }
-  new_design(id, label, TRUE,
-    "Both groups are observed across multiple periods, so their trends can be compared. Validity additionally depends on the pre-treatment trends being parallel.")
-}
-
-# ---- routing --------------------------------------------------------------
-
-diagnose_design <- function(cd, cfg, checks) {
-  designs <- list(
-    randomised = assess_randomised(cd, cfg, checks),
-    did        = assess_did(cd, cfg, checks),
-    propensity = assess_propensity(cd, cfg, checks)
+new_check <- function(id, label, status, message, detail = NULL) {
+  stopifnot(status %in% c("pass", "fail", "not_applicable"))
+  structure(
+    list(id = id, label = label, status = status,
+         message = message, detail = detail),
+    class = "validity_check"
   )
-  supported <- names(designs)[vapply(designs, `[[`, logical(1), "supported")]
+}
 
-  # Preference order reflects the strength of the identifying assumption,
-  # not what is computable. Randomisation is known by design; parallel trends
-  # is testable; conditional ignorability is neither.
-  recommended <- if ("randomised" %in% supported) "randomised"
-                 else if ("did" %in% supported)   "did"
-                 else if ("propensity" %in% supported) "propensity"
-                 else NA_character_
+# ---- standardised mean differences ---------------------------------------
 
-  rationale <- if (is.na(recommended)) {
-    "No design is supported by this data. See the reasons against each method below."
-  } else if (recommended == "randomised" && "propensity" %in% supported) {
-    paste("Randomised analysis is recommended. Propensity adjustment is also computable here,",
-          "but adjusting a balanced experiment adds variance without removing bias — there is no",
-          "confounding left for it to correct.")
+smd_numeric <- function(x1, x0) {
+  s <- sqrt((stats::var(x1) + stats::var(x0)) / 2)
+  if (!is.finite(s) || s == 0) return(0)
+  (mean(x1) - mean(x0)) / s
+}
+
+smd_prop <- function(p1, p0) {
+  s <- sqrt((p1 * (1 - p1) + p0 * (1 - p0)) / 2)
+  if (!is.finite(s) || s == 0) return(0)
+  (p1 - p0) / s
+}
+
+# For a categorical covariate, report the level with the largest imbalance.
+covariate_smd <- function(x, in_arm, in_control) {
+  if (is.numeric(x)) {
+    return(smd_numeric(x[in_arm], x[in_control]))
+  }
+  lv <- unique(stats::na.omit(x))
+  d <- vapply(lv, function(l) {
+    smd_prop(mean(x[in_arm] == l), mean(x[in_control] == l))
+  }, numeric(1))
+  d[which.max(abs(d))]
+}
+
+check_balance <- function(cd, cfg) {
+  covs <- cd$meta$covariates
+  if (!length(covs)) {
+    return(new_check(
+      "balance", "Covariate balance", "not_applicable",
+      "No covariates are declared in the configuration, so balance between groups cannot be assessed."))
+  }
+
+  dat     <- cd$data
+  control <- cd$meta$control
+  arms    <- setdiff(cd$meta$arms, control)
+  thr     <- cfg$validity$smd_threshold
+  in_control <- dat$treatment == control
+
+  rows <- list()
+  for (a in arms) {
+    in_arm <- dat$treatment == a
+    for (cv in covs) {
+      rows[[length(rows) + 1L]] <- data.frame(
+        arm = a, covariate = cv,
+        smd = covariate_smd(dat[[cv]], in_arm, in_control),
+        stringsAsFactors = FALSE
+      )
+    }
+  }
+  tbl <- do.call(rbind, rows)
+  tbl$imbalanced <- abs(tbl$smd) > thr
+
+  worst <- tbl[which.max(abs(tbl$smd)), ]
+  n_bad <- sum(tbl$imbalanced)
+
+  if (n_bad == 0L) {
+    msg <- sprintf(
+      "All %d covariate comparisons are balanced. The largest standardised difference is %.3f (%s, %s) against a threshold of %.2f. Groups are comparable before treatment, which is what random assignment should produce.",
+      nrow(tbl), abs(worst$smd), worst$covariate, worst$arm, thr)
+    new_check("balance", "Covariate balance", "pass", msg, tbl)
   } else {
-    designs[[recommended]]$reason
+    msg <- sprintf(
+      "%d of %d covariate comparisons exceed the balance threshold of %.2f. The worst is %s in the %s group, at %.3f. The groups differed before treatment, so any raw difference in outcomes mixes the treatment effect with those pre-existing differences.",
+      n_bad, nrow(tbl), thr, worst$covariate, worst$arm, worst$smd)
+    new_check("balance", "Covariate balance", "fail", msg, tbl)
   }
-
-  list(
-    designs     = designs,
-    supported   = supported,
-    recommended = recommended,
-    refused     = is.na(recommended),
-    rationale   = rationale
-  )
 }
 
-design_summary <- function(dx) {
+# ---- group sizes ----------------------------------------------------------
+
+check_group_size <- function(cd, cfg) {
+  min_n <- cfg$validity$min_group_n
+  n <- cd$meta$n_by_arm
+  names(n) <- cd$meta$arms
+  tbl <- data.frame(arm = names(n), n = as.integer(n), stringsAsFactors = FALSE)
+  small <- n[n < min_n]
+
+  if (!length(small)) {
+    new_check("group_size", "Group sizes", "pass",
+      sprintf("All %d groups meet the minimum of %d observations. The smallest is %s at %d.",
+              length(n), min_n, names(n)[which.min(n)], min(n)), tbl)
+  } else {
+    new_check("group_size", "Group sizes", "fail",
+      sprintf("%d group(s) fall below the minimum of %d: %s. Estimates for these arms would be too imprecise to act on.",
+              length(small), min_n,
+              paste(sprintf("%s (n = %d)", names(small), small), collapse = ", ")), tbl)
+  }
+}
+
+# ---- parallel pre-trends (difference-in-differences only) -----------------
+
+check_pretrend <- function(cd, cfg) {
+  if (!cd$meta$has_period) {
+    return(new_check(
+      "pretrend", "Parallel pre-trends", "not_applicable",
+      "No period column is configured, so there are no pre-treatment periods to compare. Difference-in-differences requires the same units observed before and after the intervention."))
+  }
+  new_check("pretrend", "Parallel pre-trends", "not_applicable",
+            "Pre-trend testing is implemented with the difference-in-differences estimator.")
+}
+
+# ---- runner ---------------------------------------------------------------
+
+run_validity_checks <- function(cd, cfg) {
+  checks <- list(
+    check_balance(cd, cfg),
+    check_group_size(cd, cfg),
+    check_pretrend(cd, cfg)
+  )
+  names(checks) <- vapply(checks, `[[`, character(1), "id")
+  checks
+}
+
+validity_summary <- function(checks) {
   data.frame(
-    design    = vapply(dx$designs, `[[`, character(1), "label"),
-    supported = vapply(dx$designs, `[[`, logical(1), "supported"),
-    reason    = vapply(dx$designs, `[[`, character(1), "reason"),
+    check   = vapply(checks, `[[`, character(1), "label"),
+    status  = vapply(checks, `[[`, character(1), "status"),
+    message = vapply(checks, `[[`, character(1), "message"),
     stringsAsFactors = FALSE, row.names = NULL
   )
 }
