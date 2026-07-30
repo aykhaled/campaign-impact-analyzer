@@ -1,0 +1,31 @@
+default:
+  data:
+    path: data/raw/hillstrom.csv
+    type: csv
+
+  columns:
+    unit_id: null                 # absent — one row per customer
+    treatment: segment
+    period: null                  # absent — no pre/post structure in the raw data
+    covariates: [recency, history, mens, womens, newbie, zip_code, channel]
+
+  outcomes:
+    default: spend
+    available:
+      spend: continuous
+      visit: binary
+      conversion: binary
+
+  design:
+    control_label: "No E-Mail"
+    alpha: 0.05
+    multiple_comparison: holm
+
+  validity:
+    smd_threshold: 0.1            # covariate balance tolerance
+    min_group_n: 30
+    pretrend_alpha: 0.05          # used only on the DiD path
+
+  report:
+    audience: "Head of Marketing"
+    tone: concise executive
